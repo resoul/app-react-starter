@@ -1,58 +1,73 @@
-# Airlance
+# React + TypeScript + Vite
 
-This is local stack for developers. Check out instructions below to getting started.
+This template provides a minimal setup to get React working in Vite with HMR and some ESLint rules.
 
-## Prerequires
+Currently, two official plugins are available:
 
-To work with this repository you should install docker and node.js
-Checkout instructions how to install it on your operating system.
+- [@vitejs/plugin-react](https://github.com/vitejs/vite-plugin-react/blob/main/packages/plugin-react) uses [Babel](https://babeljs.io/) (or [oxc](https://oxc.rs) when used in [rolldown-vite](https://vite.dev/guide/rolldown)) for Fast Refresh
+- [@vitejs/plugin-react-swc](https://github.com/vitejs/vite-plugin-react/blob/main/packages/plugin-react-swc) uses [SWC](https://swc.rs/) for Fast Refresh
 
-Docker: https://docs.docker.com/engine/install/
-Node.js: https://nodejs.org/en/download/
+## React Compiler
 
-## Setup local environment
+The React Compiler is currently not compatible with SWC. See [this issue](https://github.com/vitejs/vite-plugin-react/issues/428) for tracking the progress.
 
-Clone this repository
-Go to directory hygiene
-Run the following commands:
+## Expanding the ESLint configuration
 
-```
-npm install
-make services-init
-make projects-init
-make services-deploy
-```
+If you are developing a production application, we recommend updating the configuration to enable type-aware lint rules:
 
-On the output you can see all projects domains.
+```js
+export default defineConfig([
+  globalIgnores(['dist']),
+  {
+    files: ['**/*.{ts,tsx}'],
+    extends: [
+      // Other configs...
 
-Use command `make help` to get all available commands.
+      // Remove tseslint.configs.recommended and replace with this
+      tseslint.configs.recommendedTypeChecked,
+      // Alternatively, use this for stricter rules
+      tseslint.configs.strictTypeChecked,
+      // Optionally, add this for stylistic rules
+      tseslint.configs.stylisticTypeChecked,
 
-### Create a local proxy
-
-Run the following commands if you use brew on mac or use `/opt/homebrew/etc/nginx/`:
-
-```
-sudo mkdir /opt/homebrew/etc/nginx/hygiene.d
-sudo make dns
-```
-Type the directory location with trailing slash: `/opt/homebrew/etc/nginx/hygiene.d/`
-than reload nginx: `sudo nginx -s reload`
-
-Update your `/opt/homebrew/etc/nginx/nginx.conf` file, add line `include hygiene.d/*.conf;` to section http.
-
-After that add next rows to your `/etc/hosts` file
-
-```
-127.0.0.1    api.hygiene.localhost
-127.0.0.1    rabbitmq.hygiene.localhost
-127.0.0.1    adminer.hygiene.localhost
-127.0.0.1    minio.hygiene.localhost
+      // Other configs...
+    ],
+    languageOptions: {
+      parserOptions: {
+        project: ['./tsconfig.node.json', './tsconfig.app.json'],
+        tsconfigRootDir: import.meta.dirname,
+      },
+      // other options...
+    },
+  },
+])
 ```
 
-If all done correctly, you should had access to all hosts above via your browser.
+You can also install [eslint-plugin-react-x](https://github.com/Rel1cx/eslint-react/tree/main/packages/plugins/eslint-plugin-react-x) and [eslint-plugin-react-dom](https://github.com/Rel1cx/eslint-react/tree/main/packages/plugins/eslint-plugin-react-dom) for React-specific lint rules:
 
-### Local passwords
+```js
+// eslint.config.js
+import reactX from 'eslint-plugin-react-x'
+import reactDom from 'eslint-plugin-react-dom'
 
-http://adminer.hygiene.localhost hygiene/hygiene
-http://rabbitmq.hygiene.localhost hygiene/hygiene
-http://minio.hygiene.localhost hygiene_user/hygiene_password
+export default defineConfig([
+  globalIgnores(['dist']),
+  {
+    files: ['**/*.{ts,tsx}'],
+    extends: [
+      // Other configs...
+      // Enable lint rules for React
+      reactX.configs['recommended-typescript'],
+      // Enable lint rules for React DOM
+      reactDom.configs.recommended,
+    ],
+    languageOptions: {
+      parserOptions: {
+        project: ['./tsconfig.node.json', './tsconfig.app.json'],
+        tsconfigRootDir: import.meta.dirname,
+      },
+      // other options...
+    },
+  },
+])
+```
