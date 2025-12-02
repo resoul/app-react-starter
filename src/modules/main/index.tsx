@@ -1,6 +1,6 @@
 import { Routes, Route, Navigate } from 'react-router-dom';
-import { MainPage } from "@/modules/main/pages/main/page";
-import { Layout } from "@/modules/main/layout";
+import { MainPage } from "./pages/main/page";
+import { Layout } from "./layout";
 
 export default function MainModule() {
     return (

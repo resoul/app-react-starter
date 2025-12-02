@@ -1,7 +1,6 @@
 import { type ReactNode, type CSSProperties, useEffect, useMemo } from 'react';
-import { LayoutContext } from "@/modules/main/layout/components/use-layout";
+import { LayoutContext } from "./use-layout";
 
-// Provider component
 interface LayoutProviderProps {
     children: ReactNode;
     style?: CSSProperties;
