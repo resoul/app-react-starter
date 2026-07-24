@@ -1,73 +1,177 @@
-# React + TypeScript + Vite
+# @resoul/wireauth
 
-This template provides a minimal setup to get React working in Vite with HMR and some ESLint rules.
+Browser/Node client for the `wireauth` handshake protocol: RSA-signed
+challenge/response, ECDH (P-256) key exchange, and an AES-256-GCM secured
+channel afterward — built entirely on the Web Crypto API. This is the
+client-side companion to the [Go server package](../wireauth) that
+implements the same protocol.
 
-Currently, two official plugins are available:
+Like its Go counterpart, this is **transport security**, not end-to-end
+encryption between users. It secures the link between this client and your
+server (similar in spirit to TLS), and is meant to sit alongside your own
+auth — not replace it. If you need E2E encryption between users, look at
+libsignal instead.
 
-- [@vitejs/plugin-react](https://github.com/vitejs/vite-plugin-react/blob/main/packages/plugin-react) uses [Babel](https://babeljs.io/) (or [oxc](https://oxc.rs) when used in [rolldown-vite](https://vite.dev/guide/rolldown)) for Fast Refresh
-- [@vitejs/plugin-react-swc](https://github.com/vitejs/vite-plugin-react/blob/main/packages/plugin-react-swc) uses [SWC](https://swc.rs/) for Fast Refresh
+The exact wire format is documented in
+[`HANDSHAKE_SPEC.md`](./HANDSHAKE_SPEC.md) — read that if you're
+implementing a server or another client from scratch.
 
-## React Compiler
+## Install
 
-The React Compiler is currently not compatible with SWC. See [this issue](https://github.com/vitejs/vite-plugin-react/issues/428) for tracking the progress.
-
-## Expanding the ESLint configuration
-
-If you are developing a production application, we recommend updating the configuration to enable type-aware lint rules:
-
-```js
-export default defineConfig([
-  globalIgnores(['dist']),
-  {
-    files: ['**/*.{ts,tsx}'],
-    extends: [
-      // Other configs...
-
-      // Remove tseslint.configs.recommended and replace with this
-      tseslint.configs.recommendedTypeChecked,
-      // Alternatively, use this for stricter rules
-      tseslint.configs.strictTypeChecked,
-      // Optionally, add this for stylistic rules
-      tseslint.configs.stylisticTypeChecked,
-
-      // Other configs...
-    ],
-    languageOptions: {
-      parserOptions: {
-        project: ['./tsconfig.node.json', './tsconfig.app.json'],
-        tsconfigRootDir: import.meta.dirname,
-      },
-      // other options...
-    },
-  },
-])
+```
+npm install @resoul/wireauth
 ```
 
-You can also install [eslint-plugin-react-x](https://github.com/Rel1cx/eslint-react/tree/main/packages/plugins/eslint-plugin-react-x) and [eslint-plugin-react-dom](https://github.com/Rel1cx/eslint-react/tree/main/packages/plugins/eslint-plugin-react-dom) for React-specific lint rules:
+Requires an environment with the Web Crypto API: any modern browser, or
+Node.js 18+ (uses `globalThis.crypto.subtle`).
 
-```js
-// eslint.config.js
-import reactX from 'eslint-plugin-react-x'
-import reactDom from 'eslint-plugin-react-dom'
+## Quick start
 
-export default defineConfig([
-  globalIgnores(['dist']),
-  {
-    files: ['**/*.{ts,tsx}'],
-    extends: [
-      // Other configs...
-      // Enable lint rules for React
-      reactX.configs['recommended-typescript'],
-      // Enable lint rules for React DOM
-      reactDom.configs.recommended,
-    ],
-    languageOptions: {
-      parserOptions: {
-        project: ['./tsconfig.node.json', './tsconfig.app.json'],
-        tsconfigRootDir: import.meta.dirname,
-      },
-      // other options...
-    },
+You need the server's RSA **public** key, base64-encoded as SPKI/DER. This
+is not a secret, but make sure your app obtains it authentically (bundle it
+in your app config, pin it, etc.) rather than trusting an unauthenticated
+source at runtime.
+
+```ts
+import { createHandshakeClient } from "@resoul/wireauth";
+
+const client = createHandshakeClient({
+  serverPublicKeyB64: "MIIBIjANBgkqhkiG9w0BAQEFAAOCAQ8AMIIBCg...", // from your server
+});
+
+// You provide the transport: given a packet to send, resolve with the
+// server's next response. Works over WebSocket, a custom TCP framing,
+// whatever you use.
+const transport = {
+  async sendAndReceive(packet: ArrayBuffer): Promise<ArrayBuffer> {
+    ws.send(packet);
+    return new Promise((resolve) => {
+      ws.addEventListener("message", (e) => resolve(e.data), { once: true });
+    });
   },
-])
+};
+
+const session = await client.establish(transport);
+// session.aesKey, session.serverNonce are now available if you need them
+// directly, but usually you'll just use the helpers below:
+
+const packet = await session.encrypt(1, new TextEncoder().encode("hello"));
+ws.send(packet);
+
+ws.addEventListener("message", async (e) => {
+  const { plaintext, seq } = await session.decrypt(new Uint8Array(e.data));
+  console.log(`message #${seq}:`, new TextDecoder().decode(plaintext));
+});
 ```
+
+### Full WebSocket example
+
+```ts
+import { createHandshakeClient } from "@resoul/wireauth";
+
+function makeWebSocketTransport(ws: WebSocket) {
+  const queue: ArrayBuffer[] = [];
+  const waiters: ((v: ArrayBuffer) => void)[] = [];
+
+  ws.binaryType = "arraybuffer";
+  ws.addEventListener("message", (e) => {
+    const data = e.data as ArrayBuffer;
+    if (waiters.length > 0) waiters.shift()!(data);
+    else queue.push(data);
+  });
+
+  return {
+    async sendAndReceive(packet: ArrayBuffer): Promise<ArrayBuffer> {
+      ws.send(packet);
+      if (queue.length > 0) return queue.shift()!;
+      return new Promise((resolve) => waiters.push(resolve));
+    },
+  };
+}
+
+const ws = new WebSocket("wss://your-server/ws");
+await new Promise((resolve) => ws.addEventListener("open", resolve, { once: true }));
+
+const client = createHandshakeClient({ serverPublicKeyB64: "..." });
+const session = await client.establish(makeWebSocketTransport(ws));
+
+const packet = await session.encrypt(1, new TextEncoder().encode("hello"));
+ws.send(packet);
+```
+
+## API reference
+
+```ts
+const client = createHandshakeClient({
+  serverPublicKeyB64: string, // required — server's RSA public key (SPKI/DER, base64)
+  sessionSalt?: string,       // optional — only needed for computeResumeProofFor
+});
+
+// Runs stage 1 (RSA challenge/response) + stage 2 (ECDH exchange) over
+// the given transport. Throws if the server's signature fails to verify
+// or a response is malformed.
+const session = await client.establish(transport: HandshakeTransport);
+
+session.aesKey;        // CryptoKey — the derived AES-256-GCM key
+session.serverNonce;   // Uint8Array, 16 bytes — needed for resume proofs
+session.encrypt(seq, payload: Uint8Array): Promise<ArrayBuffer>;
+session.decrypt(packet: Uint8Array): Promise<{ plaintext: Uint8Array; seq: bigint }>;
+
+// Only if your app supports session resumption without re-running the
+// full handshake:
+const { authKeyIDBytes, proofA, proofB } = await client.computeResumeProofFor(
+  authKeyID: bigint,
+  masterHmacKeyRaw: ArrayBuffer,
+  serverNonce: Uint8Array,
+);
+```
+
+Low-level primitives (`importServerRSAKey`, `buildStage1Packet`,
+`deriveSharedAESKey`, `encryptSecure`, etc.) are also exported directly, for
+consumers who need finer control than the stateful client provides — see
+`src/handshake.ts`.
+
+## What you're responsible for
+
+- **The transport.** This package doesn't assume WebSocket, fetch, or
+  anything else — you implement `sendAndReceive` for whatever you're using.
+- **Sequence numbers.** `seq` passed to `encrypt` must be unique and
+  increasing per direction (a counter is enough). Reusing a seq with the
+  same key is a nonce-reuse risk for GCM's associated data.
+- **Session storage**, if you support resuming sessions later (e.g. across
+  page reloads). This package computes the resume proof but doesn't decide
+  where you persist `authKeyID`/the HMAC key — that's app-specific (the
+  original implementation this was extracted from used IndexedDB; use
+  whatever fits your app, keeping in mind this key should not be persisted
+  somewhere a script from another origin could read it).
+- **Obtaining `serverPublicKeyB64` authentically.** It's not a secret, but
+  if an attacker can substitute their own key at runtime, the handshake's
+  signature check protects you from nothing.
+
+## FAQ
+
+**Is this the Signal protocol?**
+No — see the note at the top. No forward secrecy across messages, no
+per-user identity keys, no E2E. It's a transport-security handshake, closer
+to a lightweight custom TLS than to Signal.
+
+**Does this work in React Native / non-browser environments?**
+It needs `crypto.subtle` from the Web Crypto API. Most modern JS runtimes
+(browsers, Node 18+, Deno, Bun) provide it globally. React Native doesn't by
+default — you'd need a polyfill that implements the same subset of
+`SubtleCrypto` used here (RSASSA-PKCS1-v1_5 verify, ECDH P-256, AES-GCM,
+HMAC-SHA256, SHA-256 digest).
+
+**Can I use this with plain `fetch` instead of WebSocket?**
+The handshake needs two round-trips against the *same* connection/session on
+the server (the server holds state — the nonces — between stage 1 and stage
+2), so it doesn't fit a stateless request/response model like typical REST
+`fetch` calls unless your server correlates the two stages via some session
+token. WebSocket or a persistent TCP-like connection is the natural fit.
+
+**What happens if `establish()` throws?**
+Most commonly a signature verification failure — either a wrong
+`serverPublicKeyB64`, or (worst case) a man-in-the-middle presenting a
+different key. Treat it as fatal for that connection attempt; don't retry
+silently without surfacing it, since retrying against the same attacker
+won't help.
