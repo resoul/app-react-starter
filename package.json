@@ -1,6 +1,6 @@
 {
   "name": "@resoul/wireauth",
-  "version": "0.1.0",
+  "version": "0.2.0",
   "description": "Transport-agnostic client-side RSA+ECDH handshake and AES-256-GCM secure channel (browser Web Crypto API). Companion to the Go wireauth server package.",
   "license": "MIT",
   "author": "resoul",
@@ -29,7 +29,7 @@
     "build:cjs:pkg": "node -e \"require('fs').writeFileSync('dist/cjs/package.json', JSON.stringify({type:'commonjs'}))\"",
     "clean": "rm -rf dist",
     "prepublishOnly": "npm run clean && npm run build",
-    "test": "node --test dist/cjs/*.test.js"
+    "test": "npm run build && node --test test/*.test.ts"
   },
   "keywords": [
     "handshake",
@@ -40,6 +40,7 @@
     "secure-channel"
   ],
   "devDependencies": {
+    "@types/node": "^22.0.0",
     "typescript": "^7.0.2"
   },
   "engines": {

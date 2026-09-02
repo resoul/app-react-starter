@@ -47,6 +47,17 @@ export function generateClientNonce(): Uint8Array {
     return nonce;
 }
 
+// --- Protocol v1 (DEPRECATED) ---
+//
+// v1's stage-1 signature covers only client_nonce ‖ server_nonce — it never
+// signs the ECDH public keys exchanged in stage 2, so it does not
+// authenticate the key exchange itself. An active network attacker can
+// substitute either party's ECDH public key without invalidating this
+// signature. wireauth must run inside TLS if v1 is used at all. v1 is kept
+// here only for talking to servers mid-migration; new code should use the
+// v2 functions below. See the security advisory in HANDSHAKE_SPEC.md.
+
+/** @deprecated use buildStage1PacketV2 — see the security advisory in HANDSHAKE_SPEC.md */
 export function buildStage1Packet(clientNonce: Uint8Array): ArrayBuffer {
     const packet = new Uint8Array(4 + 16);
     new DataView(packet.buffer).setUint32(0, 1, true);
@@ -54,16 +65,20 @@ export function buildStage1Packet(clientNonce: Uint8Array): ArrayBuffer {
     return packet.buffer;
 }
 
+/** @deprecated use parseStage1ResponseV2 — see the security advisory in HANDSHAKE_SPEC.md */
 export function parseStage1Response(
     responseBytes: Uint8Array
 ): { serverNonce: Uint8Array; signature: Uint8Array } | null {
-    if (responseBytes.length < 16 + 256) return null;
+    if (responseBytes.length !== 16 + 256) return null;
     return {
         serverNonce: responseBytes.slice(0, 16),
         signature: responseBytes.slice(16, 16 + 256),
     };
 }
 
+/** @deprecated the v1 signature never covered the ECDH public keys; verifying
+ * it provides no protection against a substituted key. See the security
+ * advisory in HANDSHAKE_SPEC.md and use verifyTranscriptSignature instead. */
 export async function verifyServerSignature(
     rsaKey: CryptoKey,
     clientNonce: Uint8Array,
@@ -76,8 +91,94 @@ export async function verifyServerSignature(
     return crypto.subtle.verify(
         "RSASSA-PKCS1-v1_5",
         rsaKey,
-        signature.buffer as ArrayBuffer,
-        dataToVerify.buffer
+        signature as BufferSource,
+        dataToVerify as BufferSource
+    );
+}
+
+/** @deprecated use buildStage2PacketV2 — see the security advisory in HANDSHAKE_SPEC.md */
+export async function buildStage2Packet(
+    keyPair: ECDHKeyPair
+): Promise<ArrayBuffer> {
+    const rawPubKey = await crypto.subtle.exportKey("raw", keyPair.publicKey);
+    const packet = new Uint8Array(4 + rawPubKey.byteLength);
+    new DataView(packet.buffer).setUint32(0, 2, true);
+    packet.set(new Uint8Array(rawPubKey), 4);
+    return packet.buffer;
+}
+
+// --- Protocol v2 (current) ---
+//
+// Fixes the v1 gap above by signing the full transcript — both nonces AND
+// both ECDH public keys — once, after stage 2, before the client trusts the
+// exchange. Substituting either public key now invalidates the signature.
+// Same single RSA-verify cost as v1, just checked over more data and later
+// in the flow. See HANDSHAKE_SPEC.md for the exact wire layout.
+
+export function buildStage1PacketV2(clientNonce: Uint8Array): ArrayBuffer {
+    const packet = new Uint8Array(4 + 16);
+    new DataView(packet.buffer).setUint32(0, 101, true);
+    packet.set(clientNonce, 4);
+    return packet.buffer;
+}
+
+/** v2 stage-1 response is just the server nonce — no signature yet. */
+export function parseStage1ResponseV2(
+    responseBytes: Uint8Array
+): { serverNonce: Uint8Array } | null {
+    if (responseBytes.length !== 16) return null;
+    return { serverNonce: responseBytes.slice(0, 16) };
+}
+
+export async function buildStage2PacketV2(
+    keyPair: ECDHKeyPair
+): Promise<ArrayBuffer> {
+    const rawPubKey = await crypto.subtle.exportKey("raw", keyPair.publicKey);
+    const packet = new Uint8Array(4 + rawPubKey.byteLength);
+    new DataView(packet.buffer).setUint32(0, 102, true);
+    packet.set(new Uint8Array(rawPubKey), 4);
+    return packet.buffer;
+}
+
+/** v2 stage-2 response: server_pubkey (65 bytes) ‖ transcript signature (256 bytes). */
+export function parseStage2ResponseV2(
+    responseBytes: Uint8Array
+): { serverPubKeyRaw: Uint8Array; signature: Uint8Array } | null {
+    if (responseBytes.length !== 65 + 256) return null;
+    return {
+        serverPubKeyRaw: responseBytes.slice(0, 65),
+        signature: responseBytes.slice(65, 65 + 256),
+    };
+}
+
+/**
+ * Verifies the v2 transcript signature: RSA-PKCS1v15-SHA256 over
+ * client_nonce ‖ server_nonce ‖ client_pubkey_raw ‖ server_pubkey_raw. This
+ * is the actual fix for the v1 gap — a substituted public key on either
+ * side now invalidates the signature. Call this and check the result
+ * BEFORE deriving or trusting the shared secret from deriveSharedAESKey.
+ */
+export async function verifyTranscriptSignature(
+    rsaKey: CryptoKey,
+    clientNonce: Uint8Array,
+    serverNonce: Uint8Array,
+    clientPubKeyRaw: Uint8Array,
+    serverPubKeyRaw: Uint8Array,
+    signature: Uint8Array
+): Promise<boolean> {
+    const dataToVerify = new Uint8Array(
+        clientNonce.length + serverNonce.length + clientPubKeyRaw.length + serverPubKeyRaw.length
+    );
+    let offset = 0;
+    dataToVerify.set(clientNonce, offset); offset += clientNonce.length;
+    dataToVerify.set(serverNonce, offset); offset += serverNonce.length;
+    dataToVerify.set(clientPubKeyRaw, offset); offset += clientPubKeyRaw.length;
+    dataToVerify.set(serverPubKeyRaw, offset);
+    return crypto.subtle.verify(
+        "RSASSA-PKCS1-v1_5",
+        rsaKey,
+        signature as BufferSource,
+        dataToVerify as BufferSource
     );
 }
 
@@ -95,14 +196,56 @@ export async function generateECDHKeyPair(): Promise<ECDHKeyPair> {
     return pair as ECDHKeyPair;
 }
 
-export async function buildStage2Packet(
-    keyPair: ECDHKeyPair
-): Promise<ArrayBuffer> {
-    const rawPubKey = await crypto.subtle.exportKey("raw", keyPair.publicKey);
-    const packet = new Uint8Array(4 + rawPubKey.byteLength);
-    new DataView(packet.buffer).setUint32(0, 2, true);
-    packet.set(new Uint8Array(rawPubKey), 4);
-    return packet.buffer;
+export interface DerivedDirectionalAESKeys {
+    clientToServerKey: CryptoKey;
+    serverToClientKey: CryptoKey;
+    clientToServerKeyRaw: ArrayBuffer;
+    serverToClientKeyRaw: ArrayBuffer;
+}
+
+export async function deriveDirectionalAESKeys(
+    serverPubKeyRaw: ArrayBuffer | Uint8Array,
+    clientPrivateKey: CryptoKey,
+    clientNonce: Uint8Array,
+    serverNonce: Uint8Array
+): Promise<DerivedDirectionalAESKeys> {
+    const serverPubKey = await crypto.subtle.importKey(
+        "raw",
+        serverPubKeyRaw as BufferSource,
+        { name: "ECDH", namedCurve: "P-256" },
+        false,
+        []
+    );
+
+    const sharedBits = await crypto.subtle.deriveBits(
+        { name: "ECDH", public: serverPubKey },
+        clientPrivateKey,
+        256
+    );
+
+    const salt = new Uint8Array(clientNonce.length + serverNonce.length);
+    salt.set(clientNonce, 0);
+    salt.set(serverNonce, clientNonce.length);
+    const hkdfKey = await crypto.subtle.importKey("raw", sharedBits, "HKDF", false, ["deriveBits"]);
+    const derive = (info: string) => crypto.subtle.deriveBits(
+        { name: "HKDF", hash: "SHA-256", salt, info: new TextEncoder().encode(info) },
+        hkdfKey,
+        256
+    );
+    const [clientToServerKeyRaw, serverToClientKeyRaw] = await Promise.all([
+        derive("wireauth/v2/client-to-server"),
+        derive("wireauth/v2/server-to-client"),
+    ]);
+    const importAES = (raw: ArrayBuffer) => crypto.subtle.importKey(
+        "raw", raw,
+        { name: "AES-GCM" },
+        false,
+        ["encrypt", "decrypt"]
+    );
+    const [clientToServerKey, serverToClientKey] = await Promise.all([
+        importAES(clientToServerKeyRaw), importAES(serverToClientKeyRaw),
+    ]);
+    return { clientToServerKey, serverToClientKey, clientToServerKeyRaw, serverToClientKeyRaw };
 }
 
 export interface DerivedAESKey {
@@ -110,15 +253,16 @@ export interface DerivedAESKey {
     sharedAESKeyRaw: ArrayBuffer;
 }
 
+/** @deprecated v1 key derivation. v2 callers need direction-separated keys; use deriveDirectionalAESKeys. */
 export async function deriveSharedAESKey(
-    serverPubKeyRaw: ArrayBuffer,
+    serverPubKeyRaw: ArrayBuffer | Uint8Array,
     clientPrivateKey: CryptoKey,
     clientNonce: Uint8Array,
     serverNonce: Uint8Array
 ): Promise<DerivedAESKey> {
     const serverPubKey = await crypto.subtle.importKey(
         "raw",
-        serverPubKeyRaw,
+        serverPubKeyRaw as BufferSource,
         { name: "ECDH", namedCurve: "P-256" },
         false,
         []
@@ -135,7 +279,7 @@ export async function deriveSharedAESKey(
     kdfMaterial.set(clientNonce, 32);
     kdfMaterial.set(serverNonce, 32 + 16);
 
-    const finalKeyHash = await crypto.subtle.digest("SHA-256", kdfMaterial.buffer);
+    const finalKeyHash = await crypto.subtle.digest("SHA-256", kdfMaterial);
 
     const sharedAESKey = await crypto.subtle.importKey(
         "raw",
@@ -176,6 +320,9 @@ export async function decryptSecure(
     key: CryptoKey,
     responseBytes: Uint8Array
 ): Promise<{ plaintext: Uint8Array; seq: bigint }> {
+    if (responseBytes.length < 8 + 12 + 16) {
+        throw new Error("wireauth: encrypted packet too short");
+    }
     const seqBytes = responseBytes.slice(0, 8);
     const nonce = responseBytes.slice(8, 20);
     const ciphertext = responseBytes.slice(20);
@@ -183,7 +330,7 @@ export async function decryptSecure(
     const plaintextBuf = await crypto.subtle.decrypt(
         { name: "AES-GCM", iv: nonce, additionalData: seqBytes },
         key,
-        ciphertext.buffer as ArrayBuffer
+        ciphertext as BufferSource
     );
 
     const seq = new DataView(

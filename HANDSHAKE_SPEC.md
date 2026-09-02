@@ -1,88 +1,47 @@
-# Wire Handshake Protocol v1
+# Wire Handshake Protocol v2
 
-All integers are little-endian unless stated otherwise.
-All messages are sent as binary WebSocket frames.
+All integers are little-endian unless stated otherwise. Every handshake message
+is a binary WebSocket frame and must have the exact size shown.
 
-## Stage 1 — Client Hello
+## Handshake
 
-**Client → Server**
+| Direction | Bytes | Format |
+|---|---:|---|
+| Client → Server | 20 | `u32le(101) ‖ client_nonce[16]` |
+| Server → Client | 16 | `server_nonce[16]` |
+| Client → Server | 69 | `u32le(102) ‖ client_pubkey[65]` |
+| Server → Client | 321 | `server_pubkey[65] ‖ rsa_signature[256]` |
 
-| offset | size | field        | note                     |
-|--------|------|--------------|---------------------------|
-| 0      | 4    | cmd          | always `1` (u32 LE)       |
-| 4      | 16   | client_nonce | random bytes (CSPRNG)     |
-
-Total: 20 bytes.
-
-**Server → Client**
-
-| offset | size | field        | note                                               |
-|--------|------|--------------|-----------------------------------------------------|
-| 0      | 16   | server_nonce | random bytes                                        |
-| 16     | 256  | signature    | RSA-PKCS1v15-SHA256(client_nonce ‖ server_nonce)    |
-
-Total: 272 bytes.
-
-Client verification: `RSA_Verify(server_pubkey, sig, client_nonce ‖ server_nonce)`.
-On failure — close the connection, do not retry with the same nonce.
-
-## Stage 2 — Key Exchange
-
-**Client → Server**
-
-| offset | size | field         | note                                                                |
-|--------|------|---------------|----------------------------------------------------------------------|
-| 0      | 4    | cmd           | always `2` (u32 LE)                                                 |
-| 4      | 65   | client_pubkey | ECDH P-256, uncompressed (X9.63/ANSI X9.62 format: `0x04 ‖ X ‖ Y`)   |
-
-**Server → Client**
-
-| offset | size | field         |
-|--------|------|---------------|
-| 0      | 65   | server_pubkey | same format |
-
-## Key Derivation
+The public keys are P-256 uncompressed X9.63 points. The signature is
+RSA-2048 PKCS#1 v1.5 with SHA-256 over:
 
 ```
-shared_secret = ECDH(own_private, peer_public)   // 32 bytes, P-256
-kdf_input     = shared_secret ‖ client_nonce ‖ server_nonce
-session_key   = SHA256(kdf_input)                 // 32 bytes → AES-256-GCM key
+client_nonce ‖ server_nonce ‖ client_pubkey ‖ server_pubkey
 ```
 
-The concatenation order (`shared_secret`, then `client_nonce`, then
-`server_nonce`) is FIXED. Getting the order wrong on either side produces a
-different key = a silent connection break.
+Clients must verify that signature before deriving or using traffic keys.
 
-## Stage 3+ — Secure Channel (AES-256-GCM)
+## Traffic keys
 
-Every message in either direction:
+```
+shared_secret = ECDH(own_private, peer_public)
+salt          = client_nonce ‖ server_nonce
+c2s_key       = HKDF-SHA256(shared_secret, salt, "wireauth/v2/client-to-server", 32)
+s2c_key       = HKDF-SHA256(shared_secret, salt, "wireauth/v2/server-to-client", 32)
+```
 
-| offset | size | field      | note                                                                        |
-|--------|------|------------|-------------------------------------------------------------------------------|
-| 0      | 8    | seq        | u64 **big-endian** (not LE! differs from stage 1/2)                          |
-| 8      | 12   | nonce      | random, per-message                                                           |
-| 20     | N    | ciphertext |                                                                                |
-| 20+N   | 16   | tag        | GCM auth tag (may be appended to ciphertext depending on the library — see note below) |
+The client encrypts with `c2s_key` and decrypts with `s2c_key`; the server
+does the inverse.
 
-AAD (additional authenticated data) = `seq` (8 bytes, big-endian), not the
-nonce itself.
+## Encrypted frames
 
-⚠️ **Known discrepancy in the current codebase**, called out explicitly so
-it's a documented fact rather than an assumption:
-- Go/`wirecrypto.EncryptAESGCM`: seq is big-endian; the tag is appended
-  automatically inside the ciphertext by GCM's `Seal`.
-- Web `encryptSecure`: seq is big-endian (matches).
-- Swift `computeResumeProof` (resume proof, not to be confused with
-  framing!): `authKeyID` is **little-endian**.
+```
+seq[8 big-endian] ‖ nonce[12 random] ‖ ciphertext_and_tag
+```
 
-In other words, the AEAD framing itself (stage 3+) agrees across all three
-implementations (big-endian seq). The **resume proof** (HMAC chain below)
-is the odd one out: both Swift and web use little-endian for
-`authKeyID` (`setBigUint64(0, authKeyID, true)` — the third parameter
-`true` means little-endian, despite the function's name). This is the one
-place that must be checked byte-for-byte across all three implementations
-before splitting them into separate packages — the spec should state this
-as a verified fact, not "presumably the same order everywhere."
+`seq` is AES-GCM additional authenticated data. Maintain a separate,
+strictly increasing receive counter for each direction and reject replayed or
+out-of-order frames. TLS remains mandatory for the WebSocket endpoint.
 
 ## Resume Session (HMAC chain)
 
@@ -91,12 +50,10 @@ proof_A = HMAC-SHA256(key=master_key, data=session_salt)
 proof_B = HMAC-SHA256(key=proof_A,   data=auth_key_id_bytes ‖ server_nonce)
 ```
 
-`auth_key_id_bytes`: 8 bytes, **little-endian** (stated explicitly since it
-differs from the seq field in the AEAD framing above).
+`auth_key_id_bytes`: 8 bytes, **little-endian** (note: differs from the big-endian `seq` in encrypted frames above).
 
-## Versioning
+## Legacy v1
 
-The current protocol carries no version number in the packet itself
-(cmd=1/2 are stages, not versions). If the format ever needs to change,
-proposal: reserve cmd ≥ 100 for "handshake v2", so the server can tell old
-and new clients apart from the very first byte it reads.
+v1 (`cmd` 1/2) does not authenticate ECDH public keys. It is migration-only,
+must be explicitly enabled, and must never be used outside TLS.
+

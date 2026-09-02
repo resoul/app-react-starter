@@ -16,6 +16,16 @@ The exact wire format is documented in
 [`HANDSHAKE_SPEC.md`](./HANDSHAKE_SPEC.md) — read that if you're
 implementing a server or another client from scratch.
 
+> **Security note (protocol v2):** the handshake now signs the full
+> transcript — both nonces *and* both ECDH public keys — closing a gap in
+> the original protocol where the RSA signature covered only the nonces,
+> leaving the ECDH exchange itself unauthenticated against an active
+> network attacker. See the security advisory at the top of
+> `HANDSHAKE_SPEC.md`. **`establish()` uses v2 by default.** If you're
+> talking to a server still on the old protocol, pass `useLegacyV1: true`
+> to `createHandshakeClient` — but only over TLS, and only as a temporary
+> migration step; see "Migrating from v1" below.
+
 ## Install
 
 ```
@@ -105,16 +115,19 @@ ws.send(packet);
 const client = createHandshakeClient({
   serverPublicKeyB64: string, // required — server's RSA public key (SPKI/DER, base64)
   sessionSalt?: string,       // optional — only needed for computeResumeProofFor
+  useLegacyV1?: boolean,      // optional, default false — see "Migrating from v1" below
 });
 
-// Runs stage 1 (RSA challenge/response) + stage 2 (ECDH exchange) over
-// the given transport. Throws if the server's signature fails to verify
-// or a response is malformed.
+// Runs the v2 handshake (nonce exchange, then ECDH exchange + a single
+// full-transcript RSA signature) over the given transport. Throws if the
+// signature fails to verify or a response is malformed.
 const session = await client.establish(transport: HandshakeTransport);
 
-session.aesKey;        // CryptoKey — the derived AES-256-GCM key
-session.serverNonce;   // Uint8Array, 16 bytes — needed for resume proofs
-session.encrypt(seq, payload: Uint8Array): Promise<ArrayBuffer>;
+session.clientToServerKey; // CryptoKey — derived AES-256-GCM key for client-to-server traffic
+session.serverToClientKey; // CryptoKey — derived AES-256-GCM key for server-to-client traffic
+session.aesKey;            // CryptoKey (deprecated) — alias for clientToServerKey
+session.serverNonce;       // Uint8Array, 16 bytes — needed for resume proofs
+session.encrypt(seq: number | bigint, payload: Uint8Array): Promise<ArrayBuffer>;
 session.decrypt(packet: Uint8Array): Promise<{ plaintext: Uint8Array; seq: bigint }>;
 
 // Only if your app supports session resumption without re-running the
@@ -126,10 +139,31 @@ const { authKeyIDBytes, proofA, proofB } = await client.computeResumeProofFor(
 );
 ```
 
-Low-level primitives (`importServerRSAKey`, `buildStage1Packet`,
-`deriveSharedAESKey`, `encryptSecure`, etc.) are also exported directly, for
-consumers who need finer control than the stateful client provides — see
-`src/handshake.ts`.
+Low-level primitives (`importServerRSAKey`, `buildStage1PacketV2`,
+`verifyTranscriptSignature`, `deriveDirectionalAESKeys`, `encryptSecure`, etc.)
+are also exported directly, for consumers who need finer control than the
+stateful client provides — see `src/handshake.ts`. The deprecated v1
+primitives (`buildStage1Packet`, `verifyServerSignature`, `deriveSharedAESKey`, etc.) remain
+exported for the migration case but are marked `@deprecated`.
+
+## Migrating from v1
+
+`establish()` speaks protocol v2 by default (see the security note above).
+To keep talking to a server that hasn't rolled out v2 yet:
+
+```ts
+const client = createHandshakeClient({
+  serverPublicKeyB64: "...",
+  useLegacyV1: true, // only for the migration window — remove once the
+                      // server requires v2
+});
+```
+
+Roll this out server-first: get the server accepting v2 (with v1 kept
+available via its own explicit opt-in), confirm clients can speak v2, then
+remove `useLegacyV1` from client config, and finally remove v1 support from
+the server. Don't flip clients to `useLegacyV1: false` before the server
+accepts v2 — that just breaks the connection.
 
 ## What you're responsible for
 
